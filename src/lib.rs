@@ -15,9 +15,11 @@ pub enum Error {
     InvalidUserId(&'static str),
     UserIdWrongLength,
     InvalidUserToken(&'static str),
+    InvalidLoginToken(&'static str),
     BadDigest,
     LoginTokenExpired,
     InvalidLoginCookie(&'static str),
+    InvalidUserCookie(&'static str),
     InvalidFlag,
 }
 
@@ -29,9 +31,11 @@ impl Error {
             InvalidUserId(s) => s,
             UserIdWrongLength => "user_id wrong length",
             InvalidUserToken(s) => s,
+            InvalidLoginToken(s) => s,
             BadDigest => "invalid digest",
             LoginTokenExpired => "login token has expired",
             InvalidLoginCookie(s) => s,
+            InvalidUserCookie(s) => s,
             InvalidFlag => "flag is unrecognised",
         }
     }
@@ -42,10 +46,13 @@ pub type Result<T> = result::Result<T, Error>;
 // SessionId is a 32 char hexstring
 pub type SessionId<'a> = &'a str;
 
+// UserId is a 32 char hexstring
+pub type UserId<'a> = &'a str;
+
 // Login Flags
 pub type LoginFlags = u64;
 
-const LOGIN_FLAGS: &[&'static str] = &["employee"];
+const LOGIN_FLAGS: &[&str] = &["employee"];
 
 lazy_static! {
     static ref LOGIN_FLAGS_MAP: HashMap<&'static str, LoginFlags, fasthash::murmur2::Hash32> =
@@ -54,7 +61,7 @@ lazy_static! {
 
 pub struct LoginId<'a> {
     // user_id is a 32 char hexstring
-    pub user_id: &'a str,
+    pub user_id: UserId<'a>,
 
     // flags are an authorization mechanism
     pub flags: LoginFlags,
@@ -156,6 +163,56 @@ pub fn parse_session_cookie<'a>(session_salt: &[u8; 32], cookie: &'a str) -> Res
     Ok(parts[0])
 }
 
+pub fn new_user_token(user_token_salt: &[u8; 32], user_id: &[u8; 16]) -> String {
+    let mut digest: [u8; 16] = [0; 16];
+    compute_digest(user_id, &mut digest, user_token_salt);
+    let mut token = Vec::with_capacity(32);
+    token.extend(user_id);
+    token.extend(digest);
+    base64_url::encode(&token)
+}
+
+pub fn new_user_cookie(user_cookie_salt: &[u8; 32], user_tk: &str) -> Result<String> {
+    let tk =
+        base64_url::decode(user_tk).map_err(|_| Error::InvalidUserToken("not base64 encoded"))?;
+
+    if tk.len() != 32 {
+        return Err(Error::InvalidUserToken("user token wrong length"));
+    }
+
+    let user_id = &tk[..16];
+    let mac = &tk[16..];
+    let mut digest: [u8; 16] = [0; 16];
+    compute_digest(user_id, &mut digest, user_cookie_salt);
+    if digest != mac {
+        return Err(Error::InvalidUserToken("digest does not match"));
+    }
+
+    Ok(format!("{}-{}", hex::encode(user_id), hex::encode(mac)))
+}
+
+pub fn parse_user_cookie<'a>(
+    user_cookie_salt: &[u8; 32],
+    user_cookie: &'a str,
+) -> Result<UserId<'a>> {
+    let parts = user_cookie.split('-').collect::<Vec<&str>>();
+    if parts.len() != 2 {
+        return Err(Error::InvalidUserCookie("does not have two parts"));
+    }
+
+    let user_id =
+        hex::decode(parts[0]).map_err(|_| Error::InvalidUserCookie("user_id not hexstring"))?;
+    let mac = hex::decode(parts[1]).map_err(|_| Error::InvalidUserCookie("mac not hexstring"))?;
+
+    let mut digest: [u8; 16] = [0; 16];
+    compute_digest(&user_id, &mut digest, user_cookie_salt);
+    if digest != mac[..] {
+        return Err(Error::InvalidUserCookie("invalid digest"));
+    }
+
+    Ok(parts[0])
+}
+
 // new_login_cookie will build a login cookie from a login token
 pub fn new_login_cookie(
     login_cookie_salt: &[u8; 32],
@@ -164,7 +221,7 @@ pub fn new_login_cookie(
     // time cookie will be valid for
     valid_time: time::Duration,
 ) -> Result<String> {
-    parse_user_token(login_token_salt, login_token)
+    parse_login_token(login_token_salt, login_token)
         .map(|(user_id, flags)| create_login_cookie(login_cookie_salt, &user_id, flags, valid_time))
 }
 
@@ -286,8 +343,8 @@ pub fn parse_login_cookie<'a>(
     })
 }
 
-// new_user_token will create a new url_b64 encoded login token
-pub fn new_user_token(
+// new_login_token will create a new url_b64 encoded login token
+pub fn new_login_token(
     login_token_salt: &[u8; 32],
     user_id: &str,
     flags: LoginFlags,
@@ -316,9 +373,8 @@ pub fn new_user_token(
         .as_secs()
         .to_be_bytes();
 
-    let mut token = vec![];
-    // Version
-    token.push(0);
+    // 0 is Version
+    let mut token = vec![0];
 
     // Nonce
     token.extend(nonce);
@@ -355,21 +411,21 @@ fn check_digest_match(salt: &[u8; 32], data: &[u8], digest: &[u8; 16]) -> Result
     }
 }
 
-fn parse_user_token(
+fn parse_login_token(
     login_token_salt: &[u8; 32],
     user_token: &str,
 ) -> Result<([u8; 16], LoginFlags)> {
     let mut token = vec![];
     base64_url::decode_to_vec(user_token, &mut token)
-        .map_err(|_| Error::InvalidUserToken("not base64-url"))?;
+        .map_err(|_| Error::InvalidLoginToken("not base64-url"))?;
 
     // The first byte is version
     if token[0] != 0 {
-        return Err(Error::InvalidUserToken("not version 0 "));
+        return Err(Error::InvalidLoginToken("not version 0 "));
     }
 
     if token.len() != 57 {
-        return Err(Error::InvalidUserToken("wrong length"));
+        return Err(Error::InvalidLoginToken("wrong length"));
     }
 
     let ts = &token[9..17];
@@ -469,11 +525,30 @@ mod tests {
     fn user_token() {
         let mut rng = FastRng::new();
         let salt: [u8; 32] = rng.gen();
+        let user_id: [u8; 16] = rng.gen();
+
+        let user_tk = new_user_token(&salt, &user_id);
+        let user_cookie = new_user_cookie(&salt, &user_tk).expect("invalid user token built");
+
+        let parts = user_cookie.split('-').collect::<Vec<&str>>();
+        let user_id_hex = parts[0];
+
+        assert_eq!(hex::encode(&user_id), user_id_hex);
+
+        let user_id_str = parse_user_cookie(&salt, &user_cookie).expect("invalid user cookie");
+
+        assert_eq!(user_id_hex, user_id_str);
+    }
+
+    #[test]
+    fn login_token() {
+        let mut rng = FastRng::new();
+        let salt: [u8; 32] = rng.gen();
         let user_id = hex::encode(rng.gen::<[u8; 16]>());
         let nonce: [u8; 8] = rng.gen();
         let flags: LoginFlags = 0;
 
-        let login_tk = new_user_token(
+        let login_tk = new_login_token(
             &salt,
             &user_id,
             flags,
@@ -483,21 +558,21 @@ mod tests {
         .expect("couldn't create user token");
 
         let (user_id1, flags1) =
-            parse_user_token(&salt, &login_tk).expect("couldn't parse user token");
+            parse_login_token(&salt, &login_tk).expect("couldn't parse user token");
 
         assert_eq!(user_id, hex::encode(user_id1));
         assert_eq!(flags, flags1);
     }
 
     #[test]
-    fn user_token_expired() {
+    fn login_token_expired() {
         let mut rng = FastRng::new();
         let salt: [u8; 32] = rng.gen();
         let user_id = hex::encode(rng.gen::<[u8; 16]>());
         let nonce: [u8; 8] = rng.gen();
         let flags: LoginFlags = 0;
 
-        let login_tk = new_user_token(
+        let login_tk = new_login_token(
             &salt,
             &user_id,
             flags,
@@ -507,18 +582,18 @@ mod tests {
         )
         .expect("couldn't create user token");
 
-        assert!(parse_user_token(&salt, &login_tk).is_err());
+        assert!(parse_login_token(&salt, &login_tk).is_err());
     }
 
     #[test]
-    fn user_token_wrong_salt() {
+    fn login_token_wrong_salt() {
         let mut rng = FastRng::new();
         let salt: [u8; 32] = rng.gen();
         let user_id = hex::encode(rng.gen::<[u8; 16]>());
         let nonce: [u8; 8] = rng.gen();
         let flags: LoginFlags = 0;
 
-        let login_tk = new_user_token(
+        let login_tk = new_login_token(
             &salt,
             &user_id,
             flags,
@@ -528,7 +603,7 @@ mod tests {
         )
         .expect("couldn't create user token");
 
-        assert!(parse_user_token(&rng.gen::<[u8; 32]>(), &login_tk).is_err());
+        assert!(parse_login_token(&rng.gen::<[u8; 32]>(), &login_tk).is_err());
     }
 
     #[test]
